@@ -1,0 +1,1 @@
+{"modelType":"CTGAN","params":{"epochs":100,"batchSize":64,"learningRate":0.0005,"generatorDim":[250,250,250],"discriminatorDim":[250,250,250],"pac":1},"constraints":{}}

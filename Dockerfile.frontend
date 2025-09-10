@@ -1,0 +1,28 @@
+# Frontend Dockerfile
+FROM node:18-alpine
+
+WORKDIR /app
+
+# Copy package files
+COPY synthetic-data-generator/package*.json ./
+
+# Install dependencies
+RUN npm install
+
+# Copy source code
+COPY synthetic-data-generator/src ./src
+COPY synthetic-data-generator/public ./public
+COPY synthetic-data-generator/tsconfig.json ./
+COPY synthetic-data-generator/package.json ./
+
+# Build the React app
+RUN npm run build
+
+# Install serve to run the production build
+RUN npm install -g serve
+
+# Expose port
+EXPOSE 4000
+
+# Start the application
+CMD ["serve", "-s", "build", "-l", "4000"]

@@ -1,0 +1,41 @@
+# Backend Dockerfile
+FROM python:3.10-slim
+
+WORKDIR /app
+
+# Install system dependencies
+RUN apt-get update && apt-get install -y \
+    nodejs \
+    npm \
+    curl \
+    && rm -rf /var/lib/apt/lists/*
+
+# Copy Python requirements and install
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+# Copy Python script
+COPY add2.py .
+
+# Copy synthetic-data-generator directory
+COPY synthetic-data-generator/ ./synthetic-data-generator/
+
+# Set working directory to synthetic-data-generator
+WORKDIR /app/synthetic-data-generator
+
+# Install Node.js dependencies
+RUN npm install
+
+# Create uploads directory
+RUN mkdir -p uploads
+
+# Expose port
+EXPOSE 8000
+
+# Add health check endpoint to server.js
+RUN echo 'app.get("/health", (req, res) => {\n\
+  res.status(200).json({ status: "OK", timestamp: new Date().toISOString() });\n\
+});' >> server.js
+
+# Start the backend server
+CMD ["node", "server.js"]

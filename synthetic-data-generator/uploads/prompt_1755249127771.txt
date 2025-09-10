@@ -1,0 +1,9 @@
+Create a customer dataset with:
+- customer_id (unique identifier)
+- age (18-80)
+- income (30000-150000)
+- purchase_frequency (1-52)
+- customer_segment (Basic, Premium, VIP)
+- satisfaction_score (1-100)
+
+Ensure realistic correlations between income, purchase_frequency, and customer_segment.

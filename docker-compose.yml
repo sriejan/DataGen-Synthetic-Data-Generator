@@ -1,0 +1,47 @@
+version: '3.8'
+
+services:
+  synthetic-data-generator:
+    build: .
+    ports:
+      - "4000:4000"  # React frontend
+      - "8000:8000"  # Node.js backend
+    volumes:
+      - ./synthetic-data-generator/uploads:/app/synthetic-data-generator/uploads
+      - ./add2.py:/app/add2.py
+    environment:
+      - NODE_ENV=production
+      - PORT=4000
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+
+  # Alternative: Separate services approach
+  frontend:
+    build:
+      context: .
+      dockerfile: Dockerfile.frontend
+    ports:
+      - "4000:4000"
+    depends_on:
+      - backend
+    environment:
+      - REACT_APP_API_URL=http://localhost:8000
+    restart: unless-stopped
+
+  backend:
+    build:
+      context: .
+      dockerfile: Dockerfile.backend
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./synthetic-data-generator/uploads:/app/synthetic-data-generator/uploads
+      - ./add2.py:/app/add2.py
+    environment:
+      - NODE_ENV=production
+    restart: unless-stopped
