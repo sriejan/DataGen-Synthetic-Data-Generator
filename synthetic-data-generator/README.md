@@ -23,12 +23,11 @@ A modern React frontend for generating high-quality synthetic data using AI mode
 
 ### Prerequisites
 
-- Node.js (v14+)
-- Python 3.7+ (for backend)
-- pip (for installing Python dependencies)
+- Node.js (v18 or v20)
+- Python 3.8+
+- pip
 
 ### Installation
-
 1. Clone the repository:
 ```
 git clone <repository-url>
@@ -47,32 +46,34 @@ pip install -r requirements.txt
 
 ### Running the Application
 
-1. Start the backend server:
+From `synthetic-data-generator/` in two terminals:
+
+1) Backend (Node + Python CLI):
 ```
-python app.py
+node server.js
 ```
 
-2. Start the React development server:
+2) Frontend (CRA dev server on port 4000):
 ```
 npm start
 ```
 
-3. Open your browser and navigate to `http://localhost:4000`
+Then open `http://localhost:4000`.
 
 ## Backend API
 
-The frontend communicates with a Flask API backend that handles:
+The frontend talks to a Node/Express server (`server.js`, port 8000). The Node server shells out to a Python CLI (`../add2.py`) for:
 
-- Data generation via Gemini 2.0 Flash
-- Model training with SDV library
-- Data transformations
-- File processing
+- Data generation (offline fallback if Gemini not configured)
+- Model training with SDV (CTGAN/TVAE/CopulaGAN)
+- File processing (CSV/XLSX)
+- Safe (no-op) transformations
 
 ## Development Notes
 
-- Backend API runs on port 5000
-- Frontend development server runs on port 4000
-- The frontend proxy configuration is set up to forward API requests to the backend
+- Backend API runs on port 8000
+- Frontend dev server runs on port 4000
+- The frontend `proxy` forwards to `http://localhost:8000`
 
 ## License
 

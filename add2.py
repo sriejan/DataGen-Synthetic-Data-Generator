@@ -1,552 +1,514 @@
-import streamlit as st  
-import pandas as pd
-import numpy as np
-import openai
-from sdv.single_table import CTGANSynthesizer, TVAESynthesizer, CopulaGANSynthesizer
+import argparse
 import json
-import math
-from io import StringIO
-import logging
-from typing import List, Dict, Any
-import warnings
-import sys
-import traceback
-from datetime import datetime
 import os
-from dotenv import load_dotenv
+import sys
+import re
+from io import StringIO
+from typing import Any, Dict, List, Optional
 
-
-
-# Set up logging
-def setup_logging():
-    log_filename = f"gan_training_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
-    logging.basicConfig(
-        level=logging.DEBUG,
-        format='%(asctime)s - %(levelname)s - %(message)s',
-        handlers=[
-            logging.FileHandler(log_filename),
-            logging.StreamHandler(sys.stdout)
-        ]
-    )
-    return logging.getLogger(__name__)
-
-logger = setup_logging()
-# Initialize session state variables
-if 'generated_data' not in st.session_state:
-    st.session_state.generated_data = None
-if 'gan_data' not in st.session_state:
-    st.session_state.gan_data = None
-if 'metadata' not in st.session_state:
-    st.session_state.metadata = None
-if 'column_types' not in st.session_state:
-    st.session_state.column_types = {}
-if 'id_column' not in st.session_state:
-    st.session_state.id_column = None
-
-# Page configuration
-st.set_page_config(
-    page_title="Advanced Synthetic Data Generator",
-    page_icon="🧊",
-    layout="wide"
+import numpy as np
+import pandas as pd
+from sdv.single_table import (
+    CTGANSynthesizer,
+    TVAESynthesizer,
+    CopulaGANSynthesizer,
 )
-# -------------------------------
-# NEW: Prompt Engineering Agent using Google Gemini 2.0 Flash
-# -------------------------------
+from sdv.metadata import SingleTableMetadata
 
-# Import the Google GenAI SDK (Gemini 2.0 Flash)
-from google import genai
-
-# Initialize the Gemini client
-gemini_client = genai.Client(
-    api_key="AIzaSyAYWzyyBgvc_y5vtgHtOe7T3fHd42QRX2Q",
-    http_options={"api_version": "v1alpha"},
-)
+# Optional: Gemini, only used if configured
+try:
+    import google.generativeai as genai  # type: ignore
+except Exception:  # pragma: no cover - optional
+    genai = None  # type: ignore
 
 
-# -------------------------------
-# Prompt Engineering Agent using Google Gemini 2.0 Flash
+def eprint(*args: Any, **kwargs: Any) -> None:
+    print(*args, file=sys.stderr, **kwargs)
 
-def engineer_prompt(user_prompt: str) -> str:
-    """
-    Uses Google Gemini 2.0 Flash to generate an engineered prompt.
-    This agent takes a dataset description without explicit column names
-    and returns a modified prompt that includes suggested column names,
-    data types, realistic value ranges, and correlations.
-    """
-    system_instruction = (
-        "You are a prompt engineering expert for synthetic data generation. "
-        "Given the following dataset description that does not include explicit column names, "
-        "design a complete prompt for a synthetic data generator. Include suggested column names, "
-        "their data types, realistic value ranges, and any correlations. Do not include any row counts. "
-        "Output only the engineered prompt with a CSV header and clear instructions without any markdown formatting (i.e. do not include triple backticks or any other delimiters at the start or end)"
-    )
-    user_instructions = f"Dataset description: {user_prompt}"
-    
-    response = gemini_client.models.generate_content(
-        model="gemini-2.0-flash",  # Using Gemini 2.0 Flash as per the latest documentation :contentReference[oaicite:0]{index=0}
-        contents=[system_instruction, user_instructions]
-    )
-    engineered = response.text.strip()
-    return engineered
 
-# -------------------------------
-# Data Generation using Gemini instead of OpenAI
+def ensure_uploads_dir() -> str:
+    uploads_dir = os.path.join(os.getcwd(), 'uploads')
+    os.makedirs(uploads_dir, exist_ok=True)
+    return uploads_dir
 
-def generate_data_chunk(prompt: str, rows: int, chunk_size: int = 100) -> str:
-    """
-    Generates a chunk of synthetic CSV data using Google Gemini 2.0 Flash.
-    The prompt should be engineered (or raw) and is used to generate the data.
-    """
-    system_prompt = (
-        "You are a data generation expert. Generate synthetic data that:\n"
-        "1. Strictly follows CSV format\n"
-        "2. Maintains realistic value distributions\n"
-        "3. Preserves specified correlations\n"
-        "4. Contains no missing values\n"
-        "Respond only with the CSV data, no additional text and without any markdown formatting (i.e. do not include triple backticks or any other delimiters at the start or end"
-    )
-    user_prompt = (
-        f"Generate {rows} rows of synthetic data based on the following prompt:\n{prompt}\n\n"
-        "Output requirements:\n"
-        "- Valid CSV format with header\n"
-        "- Realistic and consistent values\n"
-        "- No NULL or missing values\n"
-        "- Maintain logical relationships between fields"
 
-    )
-    print(user_prompt)
-    response = gemini_client.models.generate_content(
-        model="gemini-2.0-flash",
-        contents=[system_prompt, user_prompt]
-    )
-    return response.text.strip()
-
-# -------------------------------
-# Import the unified Metadata class
-from sdv.metadata import Metadata
-
-def create_metadata(data: pd.DataFrame, categorical_columns: List[str]) -> Metadata:
-    metadata = Metadata.detect_from_dataframes(data={'default': data})
-    id_column = st.selectbox(
-        "Select the ID/Primary Key column (optional - select 'None' if no primary key needed):",
-        options=['None'] + data.columns.tolist(),
-        help="Select 'None' if you don't need any column to be a unique identifier"
-    )
-    if id_column != 'None':
-        if len(data[id_column].unique()) == len(data):
-            metadata.update_column(id_column, sdtype='id', table_name='default')
-            st.success(f"{id_column} set as primary key - all values are unique")
+def infer_column_types(df: pd.DataFrame) -> Dict[str, str]:
+    types: Dict[str, str] = {}
+    for col in df.columns:
+        series = df[col]
+        if pd.api.types.is_bool_dtype(series):
+            types[col] = 'boolean'
+        elif pd.api.types.is_numeric_dtype(series):
+            types[col] = 'numerical'
+        elif pd.api.types.is_datetime64_any_dtype(series):
+            types[col] = 'datetime'
         else:
-            st.warning(f"{id_column} contains duplicate values and cannot be used as a primary key")
-            st.info("Treating it as a regular numerical column instead")
-            metadata.update_column(id_column, sdtype='numerical', table_name='default')
-    st.write("Specify column types:")
-    for column in data.columns:
-        if column != id_column or id_column == 'None':
-            col_type = st.selectbox(
-                f"Type for {column}:",
-                options=['categorical', 'numerical', 'datetime', 'boolean'],
-                key=f"col_type_{column}"
-            )
-            metadata.update_column(column, sdtype=col_type, table_name='default')
-    return metadata
+            types[col] = 'categorical'
+    return types
 
-# Multi-model training function
-def train_synthesizer(model_choice: str, data: pd.DataFrame, params: Dict[str, Any], metadata: Metadata):
-    logger.info(f"Selected model: {model_choice}")
-    if model_choice == "CTGAN":
-        synthesizer = CTGANSynthesizer(
-            metadata,
-            epochs=params['epochs'],
-            batch_size=params['batch_size'],
-            generator_dim=params['generator_dim'],
-            discriminator_dim=params['discriminator_dim'],
-            generator_lr=params['learning_rate'],
-            discriminator_lr=params['learning_rate'],
-            pac=params['pac']
-        )
-    elif model_choice == "TVAE":
-        synthesizer = TVAESynthesizer(
-            metadata,
-            epochs=params['epochs'],
-            batch_size=params['batch_size']
-        )
-    elif model_choice == "CopulaGAN":
-        synthesizer = CopulaGANSynthesizer(
-            metadata,
-            epochs=params['epochs'],
-            batch_size=params['batch_size'],
-            generator_dim=params['generator_dim'],
-            discriminator_dim=params['discriminator_dim'],
-            generator_lr=params['learning_rate'],
-            discriminator_lr=params['learning_rate'],
-            pac=params['pac']
-        )
-    else:
-        st.error("Invalid model selection")
+
+def dataset_from_df(df: pd.DataFrame, id_column: Optional[str] = None) -> Dict[str, Any]:
+    column_types = infer_column_types(df)
+    data_records: List[Dict[str, Any]] = []
+    for _, row in df.iterrows():
+        # Convert numpy types to native Python types for JSON serialization
+        record: Dict[str, Any] = {}
+        for k, v in row.items():
+            if pd.isna(v):
+                record[k] = None
+            elif isinstance(v, (np.integer, np.floating)):
+                record[k] = v.item()
+            elif isinstance(v, (np.bool_,)):
+                record[k] = bool(v)
+            else:
+                record[k] = v
+        data_records.append(record)
+    return {
+        'data': data_records,
+        'columns': list(df.columns),
+        'columnTypes': column_types,
+        'idColumn': id_column if id_column else None,
+    }
+
+
+def to_snake(name: str) -> str:
+    s = name.strip().lower()
+    s = re.sub(r"[^a-z0-9]+", "_", s)
+    s = re.sub(r"_+", "_", s)
+    return s.strip('_')
+
+
+def parse_prompt_columns(prompt: str) -> List[Dict[str, Any]]:
+    # Parses bullet lines like: "- age (18-80)" or "- customer_segment (Basic, Premium, VIP)"
+    fields: List[Dict[str, Any]] = []
+    for line in prompt.splitlines():
+        m = re.match(r"\s*[-*]\s*([a-zA-Z0-9_\s]+?)\s*\(([^\)]*)\)", line)
+        if not m:
+            continue
+        raw_name = m.group(1).strip()
+        meta = m.group(2).strip()
+        name = to_snake(raw_name)
+        # Identify range "min-max"
+        range_match = re.match(r"\s*(-?\d+(?:\.\d+)?)\s*[-–]\s*(-?\d+(?:\.\d+)?)\s*", meta)
+        if range_match:
+            lo = float(range_match.group(1))
+            hi = float(range_match.group(2))
+            is_int = lo.is_integer() and hi.is_integer()
+            fields.append({'name': name, 'type': 'numerical', 'min': lo, 'max': hi, 'int': is_int})
+            continue
+        # Identify allowed values "A, B, C"
+        values = [v.strip() for v in meta.split(',') if v.strip()]
+        if values and all(re.match(r"^[a-zA-Z0-9_\- ]+$", v) for v in values):
+            fields.append({'name': name, 'type': 'categorical', 'values': values})
+            continue
+        # Fallback to categorical
+        fields.append({'name': name, 'type': 'categorical', 'values': []})
+    return fields
+
+
+def generate_offline_dataset(prompt: str, rows: int) -> pd.DataFrame:
+    fields = parse_prompt_columns(prompt)
+    if not fields:
+        # Fallback generic dataset
+        cols = ['col_a', 'col_b', 'col_c']
+        data = {
+            'col_a': np.random.randint(0, 100, size=rows),
+            'col_b': np.random.choice(['A', 'B', 'C'], size=rows),
+            'col_c': np.random.choice([True, False], size=rows),
+        }
+        return pd.DataFrame(data, columns=cols)
+    out: Dict[str, Any] = {}
+    for f in fields:
+        if f['type'] == 'numerical':
+            lo = f.get('min', 0)
+            hi = f.get('max', 100)
+            if f.get('int', True):
+                out[f['name']] = np.random.randint(int(lo), int(hi) + 1, size=rows)
+            else:
+                out[f['name']] = np.random.uniform(lo, hi, size=rows)
+        elif f['type'] == 'categorical':
+            values = f.get('values') or ['A', 'B']
+            out[f['name']] = np.random.choice(values, size=rows)
+        else:
+            out[f['name']] = np.random.choice([True, False], size=rows)
+    return pd.DataFrame(out)
+
+
+def try_init_gemini() -> Optional[Any]:  # Any to avoid strict import typing
+    if genai is None:
+        return None
+    api_key = os.environ.get('GEMINI_API_KEY')
+    if not api_key:
+        return None
+    try:
+        genai.configure(api_key=api_key)
+        return genai.GenerativeModel('gemini-1.5-flash')
+    except Exception as ex:  # pragma: no cover - environment-specific
+        eprint(f"Gemini init failed: {ex}")
         return None
 
-    logger.info("Initializing synthesizer")
-    synthesizer.fit(data)
-    logger.info("Model training completed successfully")
-    return synthesizer
 
-def validate_synthetic_data(original_data: pd.DataFrame, synthetic_data: pd.DataFrame, constraints: Dict):
-    validation_results = {}
-    for column in original_data.columns:
-        validation_results[column] = {
-            'original_mean': original_data[column].mean() if pd.api.types.is_numeric_dtype(original_data[column]) else None,
-            'synthetic_mean': synthetic_data[column].mean() if pd.api.types.is_numeric_dtype(synthetic_data[column]) else None,
-            'original_std': original_data[column].std() if pd.api.types.is_numeric_dtype(original_data[column]) else None,
-            'synthetic_std': synthetic_data[column].std() if pd.api.types.is_numeric_dtype(synthetic_data[column]) else None,
-            'constraint_violations': 0
-        }
-        if column in constraints:
-            if 'min' in constraints[column]:
-                violations = (synthetic_data[column] < constraints[column]['min']).sum()
-                validation_results[column]['constraint_violations'] += violations
-            if 'max' in constraints[column]:
-                violations = (synthetic_data[column] > constraints[column]['max']).sum()
-                validation_results[column]['constraint_violations'] += violations
-    return validation_results
-
-# -------------------------------
-# Main UI
-st.title("🧠 Advanced Synthetic Data Generator")
-st.markdown("Generate high-quality synthetic data using FGenerative AI and Deep Learning Concepts")
-
-if st.button("View Training Logs"):
+def cmd_engineer_prompt(args: argparse.Namespace) -> int:
+    with open(args.prompt, 'r', encoding='utf-8') as f:
+        user_prompt = f.read()
+    model = try_init_gemini()
+    if model is None:
+        # Offline fallback: return the original prompt
+        print(user_prompt.strip())
+        return 0
     try:
-        with open(logger.handlers[0].baseFilename, 'r') as f:
-            logs = f.read()
-        st.text_area("Training Logs", logs, height=400)
-    except Exception as e:
-        st.error(f"Could not load logs: {str(e)}")
-
-# --- Data Input Mode ---
-st.subheader("Step 1: Dataset Specification")
-data_input_mode = st.radio("Select Data Input Mode", options=["Generate from Prompt", "Upload Excel Sheet"], index=0)
-
-if data_input_mode == "Generate from Prompt":
-    with st.expander("Dataset Generation from Prompt", expanded=True):
-        dataset_prompt = st.text_area("Describe your dataset requirements:",
-            """Create a customer dataset with:
-- customer_id (unique identifier)
-- age (18-80)
-- income (30000-150000)
-- purchase_frequency (1-52)
-- customer_segment (Basic, Premium, VIP)
-- satisfaction_score (1-100)
-
-Ensure realistic correlations between income, purchase_frequency, and customer_segment.""")
-        # New checkbox: automatically use prompt engineering if columns are not specified.
-        use_prompt_engineering = st.checkbox("Automatically determine column names if not provided", value=True)
-        row_count = st.number_input("Number of rows to generate", min_value=100, max_value=10000, value=500, step=100)
-        chunk_size = st.number_input("Chunk size for generation", min_value=50, max_value=500, value=100, step=50)
-        if st.button("Generate Initial Dataset"):
-            with st.spinner("Generating synthetic data..."):
-                # Apply prompt engineering if enabled
-                if use_prompt_engineering:
-                    st.info("Running prompt engineering to determine column names and dataset structure...")
-                    engineered_prompt = engineer_prompt(dataset_prompt)
-                    st.code(engineered_prompt, language="text")
-                else:
-                    engineered_prompt = dataset_prompt
-                chunks = []
-                num_chunks = math.ceil(row_count / chunk_size)
-                progress_bar = st.progress(0)
-                for i in range(num_chunks):
-                    current_chunk_size = min(chunk_size, row_count - i * chunk_size)
-                    # Use the engineered prompt for every chunk to ensure consistency
-                    chunk_data = generate_data_chunk(engineered_prompt, current_chunk_size)
-                    if chunk_data:
-                        chunks.append(chunk_data)
-                    progress_bar.progress((i + 1) / num_chunks)
-                full_data = "\n".join([chunks[0]] + [ "\n".join(chunk.split("\n")[1:]) for chunk in chunks[1:]])
-                try:
-                    st.session_state.generated_data = pd.read_csv(StringIO(full_data))
-                    st.success("Initial dataset generated successfully!")
-                    st.dataframe(st.session_state.generated_data.head())
-                except Exception as e:
-                    st.error(f"Error parsing generated data: {str(e)}")
-                    
-elif data_input_mode == "Upload Excel Sheet":
-    with st.expander("Upload Your Dataset", expanded=True):
-        uploaded_file = st.file_uploader("Upload an Excel or CSV file", type=["xlsx", "xls", "csv"])
-        if uploaded_file is not None:
-            try:
-                if uploaded_file.name.endswith(('xlsx', 'xls')):
-                    st.session_state.generated_data = pd.read_excel(uploaded_file)
-                else:
-                    st.session_state.generated_data = pd.read_csv(uploaded_file)
-                st.success("Dataset uploaded successfully!")
-                st.dataframe(st.session_state.generated_data.head())
-            except Exception as e:
-                st.error(f"Error reading the file: {str(e)}")
-
-# --- Data Configuration Section ---
-if st.session_state.generated_data is not None:
-    with st.expander("Step 1.5: Data Configuration", expanded=True):
-        st.subheader("Configure Column Types and Primary Key")
-        id_column = st.selectbox("Select the ID/Primary Key column (optional - select 'None' if no primary key needed):",
-            options=['None'] + st.session_state.generated_data.columns.tolist(),
-            help="Select 'None' if you don't need any column to be a unique identifier")
-        st.subheader("Specify Column Types")
-        column_types = {}
-        for column in st.session_state.generated_data.columns:
-            if column != id_column or id_column == 'None':
-                col_type = st.selectbox(f"Type for {column}:", options=['categorical', 'numerical', 'datetime', 'boolean'],
-                    key=f"col_type_{column}")
-                column_types[column] = col_type
-        total_rows = len(st.session_state.generated_data)
-        for column, col_type in column_types.items():
-            if col_type == 'categorical':
-                unique_count = st.session_state.generated_data[column].nunique()
-                if unique_count / total_rows > 0.5:
-                    st.warning(f"Column '{column}' has high cardinality ({unique_count} unique values out of {total_rows}).")
-        if st.button("Apply Data Configuration"):
-            try:
-                metadata = Metadata.detect_from_dataframes(data={'default': st.session_state.generated_data})
-                for column, col_type in column_types.items():
-                    metadata.update_column(column, sdtype=col_type, table_name='default')
-                if id_column != 'None':
-                    if len(st.session_state.generated_data[id_column].unique()) == len(st.session_state.generated_data):
-                        metadata.update_column(id_column, sdtype='id', table_name='default')
-                        st.success(f"{id_column} set as primary key - all values are unique")
-                    else:
-                        st.warning(f"{id_column} contains duplicate values and cannot be used as a primary key")
-                        st.info("Treating it as a regular numerical column instead")
-                st.session_state.metadata = metadata
-                st.success("Data configuration applied successfully!")
-            except Exception as e:
-                st.error(f"Error configuring metadata: {str(e)}")
-
-# --- Simplified Data Transformation Step for Uploaded Datasets ---
-import re
-
-def clean_generated_code(code_text: str) -> str:
-    """
-    Removes markdown formatting markers such as triple backticks and triple single quotes.
-    """
-    # Remove any instances of triple backticks with optional language identifier.
-    cleaned = re.sub(r"```(?:python)?", "", code_text)
-    # Remove any instances of triple single quotes.
-    cleaned = re.sub(r"'''", "", cleaned)
-    return cleaned.strip()
-
-if data_input_mode == "Upload Excel Sheet" and st.session_state.generated_data is not None:
-    with st.expander("Step 1.7: Data Transformation", expanded=True):
-        st.markdown("### Data Transformation")
-        st.markdown("Below is a preview and schema summary of your dataset:")
-        st.write(st.session_state.generated_data.describe(include='all'))
-        st.dataframe(st.session_state.generated_data.head(10))
-        nl_transformation = st.text_area("Describe your desired data transformations", placeholder="Enter your instructions here...")
-        
-        if st.button("Generate Transformation Code"):
-            with st.spinner("Generating transformation code..."):
-                sample_csv = st.session_state.generated_data.head(10).to_csv(index=False)
-                system_prompt = (
-                    "You are a data transformation expert. Generate Python Pandas code that transforms a DataFrame named 'df' "
-                    "according to the following natural language instructions. Ensure the code is type-safe. "
-                    "Output only the raw Python code as inline statements without any markdown formatting (do not include triple backticks, triple single quotes, or language identifiers). "
-                    "Do not define any functions; write inline statements that directly modify 'df'."
-                )
-                user_prompt = (
-                    f"Here is a sample of the data:\n{sample_csv}\n\n"
-                    f"Transform the data as described:\n{nl_transformation}\n\n"
-                    "Generate the transformation code following these rules: output only raw Python code with no markdown formatting, and do not use any function definitions; write inline statements that directly transform 'df'."
-                )
-                try:
-                    response = gemini_client.models.generate_content(
-                        model="gemini-2.0-flash",
-                        contents=[system_prompt, user_prompt]
-                    )
-                    transformation_code = response.text.strip()
-                    # Post-process the generated code to remove any unwanted markdown markers.
-                    transformation_code = clean_generated_code(transformation_code)
-                    st.markdown("### Generated Transformation Code")
-                    st.code(transformation_code, language="python")
-                    st.session_state.transformation_code = transformation_code
-                except Exception as e:
-                    st.error(f"Error generating transformation code: {str(e)}")
-        
-        if "transformation_code" in st.session_state:
-            if st.button("Test Transformation Code"):
-                with st.spinner("Testing transformation on sample data..."):
-                    try:
-                        local_vars = {"df": st.session_state.generated_data.head(10).copy()}
-                        exec(st.session_state.transformation_code, {}, local_vars)
-                        if 'df' in local_vars:
-                            st.markdown("### Preview of Transformed Sample Data")
-                            st.dataframe(local_vars['df'])
-                            st.session_state.test_transformed = local_vars['df']
-                        else:
-                            st.error("The transformation code did not produce a DataFrame named 'df'.")
-                    except Exception as e:
-                        st.error(f"Error testing transformation code: {str(e)}")
-            
-            if st.button("Apply Transformation Code"):
-                with st.spinner("Applying transformation code to the full dataset..."):
-                    try:
-                        original_data = st.session_state.generated_data.copy()
-                        local_vars = {"df": st.session_state.generated_data.copy()}
-                        exec(st.session_state.transformation_code, {}, local_vars)
-                        if 'df' in local_vars:
-                            st.session_state.generated_data = local_vars['df']
-                            st.success("Data transformation applied successfully!")
-                            st.dataframe(st.session_state.generated_data.head(10))
-                        else:
-                            st.error("The transformation code did not produce a DataFrame named 'df'. Rolling back changes.")
-                            st.session_state.generated_data = original_data
-                    except Exception as e:
-                        st.error(f"Error applying transformation code: {str(e)}. Rolling back changes.")
-                        st.session_state.generated_data = original_data
+        resp = model.generate_content([
+            "You are a prompt engineering expert for synthetic data generation. "
+            "Design a complete prompt for a synthetic data generator including suggested column names, "
+            "data types, realistic ranges, and correlations. Do not include row counts. \n"
+            "Output only the engineered prompt, without any markdown backticks.",
+            f"Dataset description: {user_prompt}",
+        ])
+        engineered = (resp.text or '').strip()
+        print(engineered)
+    except Exception as ex:
+        eprint(f"Engineer prompt failed, returning original. Error: {ex}")
+        print(user_prompt.strip())
+    return 0
 
 
-
-
-def generate_value_constraints(user_prompt: str) -> str:
-
-    system_instruction = (
-        "You are a data generation expert. Given the following dataset description, "
-        "produce a JSON object representing the value constraints for each field. "
-        "For each numeric field, include 'min' and 'max' values. "
-        "Output only the raw JSON without any markdown formatting or triple backticks."
-    )
-    user_instructions = f"Dataset description: {user_prompt}"
-    
-    response = gemini_client.models.generate_content(
-        model="gemini-2.0-flash",
-        contents=[system_instruction, user_instructions]
-    )
-    json_constraints = response.text.strip()
-    # If by any chance the response still contains markdown formatting, remove it.
-    if json_constraints.startswith("```"):
-        json_constraints = json_constraints.split("\n", 1)[-1]
-    if json_constraints.endswith("```"):
-        json_constraints = json_constraints.rsplit("\n", 1)[0]
-    return json_constraints
-
-def validate_json_format(json_text: str) -> bool:
-    """
-    Validates that the provided text is a properly formatted JSON.
-    Returns True if valid, False otherwise.
-    """
+def cmd_generate_constraints(args: argparse.Namespace) -> int:
+    with open(args.prompt, 'r', encoding='utf-8') as f:
+        user_prompt = f.read()
+    model = try_init_gemini()
+    if model is None:
+        # Offline naive extraction: build min/max if found
+        constraints: Dict[str, Dict[str, Any]] = {}
+        for fdef in parse_prompt_columns(user_prompt):
+            if fdef['type'] == 'numerical':
+                constraints[fdef['name']] = {
+                    'min': fdef.get('min', 0),
+                    'max': fdef.get('max', 100),
+                }
+        print(json.dumps(constraints))
+        return 0
     try:
-        json.loads(json_text)
-        return True
-    except Exception as e:
-        st.error(f"Invalid JSON: {e}")
-        return False
+        resp = model.generate_content([
+            "Given the dataset description, produce a JSON object of value constraints per field. "
+            "For numeric fields include 'min' and 'max'. Output only raw JSON with no backticks.",
+            f"Dataset description: {user_prompt}",
+        ])
+        text = (resp.text or '').strip()
+        # Remove accidental backticks
+        text = re.sub(r"^```(?:json)?", "", text).strip()
+        text = re.sub(r"```$", "", text).strip()
+        # Validate JSON
+        try:
+            json.loads(text)
+        except Exception:
+            text = '{}'  # Fallback
+        print(text)
+    except Exception as ex:
+        eprint(f"Constraints generation failed: {ex}")
+        print('{}')
+    return 0
 
-# -------------------------------
-# In the GAN Configuration Section (within the Streamlit UI)
-# Replace the static Value Constraints text area with an automatically generated one.
 
-if st.session_state.generated_data is not None:
-    with st.expander("Step 2: Model Configuration", expanded=True):
-        if st.session_state.metadata is None:
-            st.warning("Please configure data types and primary key in the Data Configuration section above")
+def cmd_generate(args: argparse.Namespace) -> int:
+    with open(args.prompt, 'r', encoding='utf-8') as f:
+        prompt_text = f.read()
+    if args.use_engineering and prompt_text:
+        # Try to engineer, but don't fail if unavailable
+        try:
+            model = try_init_gemini()
+            if model is not None:
+                resp = model.generate_content([
+                    "You are a prompt engineering expert for synthetic data generation. "
+                    "Design a complete prompt for a synthetic data generator including suggested column names, "
+                    "data types, realistic ranges, and correlations. Do not include row counts. \n"
+                    "Output only the engineered prompt, without any markdown backticks.",
+                    f"Dataset description: {prompt_text}",
+                ])
+                prompt_text = (resp.text or '').strip()
+        except Exception as ex:
+            eprint(f"Prompt engineering skipped due to error: {ex}")
+
+    model = try_init_gemini()
+    df: pd.DataFrame
+    if model is None:
+        df = generate_offline_dataset(prompt_text, args.rows)
     else:
-            st.success("Metadata configuration detected successfully!")
-        
-        # Model selection widget for multi-model support
-        model_choice = st.selectbox("Select Synthetic Data Generation Model", ["CTGAN", "TVAE", "CopulaGAN"], index=0)
-        
-        col1, col2 = st.columns([1, 2])
-        with col1:
-            st.subheader("Model Parameters")
-            gan_params = {
-                'epochs': st.slider("Training Epochs", 100, 2000, 500),
-                'batch_size': st.slider("Batch Size", 64, 512, 250),
-                'learning_rate': st.select_slider("Learning Rate", options=[0.0001, 0.0005, 0.001, 0.005], value=0.0005),
-                'generator_dim': eval(st.text_input("Generator Architecture", "[250, 250, 250]")),
-                'discriminator_dim': eval(st.text_input("Discriminator Architecture", "[250, 250, 250]")),
-                'pac': st.slider("PAC", 1, 10, 5)
-            }
-        with col2:
-            st.subheader("Data Constraints")
-            if data_input_mode == "Generate from Prompt":
-                # Automatically generate constraints JSON from the dataset prompt using Gemini.
-                if st.button("Generate Value Constraints Automatically"):
-                    with st.spinner("Generating value constraints from dataset description..."):
-                        constraints_json_generated = generate_value_constraints(dataset_prompt)
-                        st.session_state.generated_constraints = constraints_json_generated
-                        st.success("Value constraints generated!")
-                # Prefill the text area with the generated JSON (or "{}" if not generated yet)
-                constraints_default = st.session_state.get("generated_constraints", "{}")
-                    else:
-                constraints_default = "{}"
-            constraints_json = st.text_area("Value Constraints (JSON)", constraints_default, height=150)
-            
-            # New: Button to validate the JSON
-            if st.button("Validate JSON"):
-                if validate_json_format(constraints_json):
-                    st.success("The JSON is valid!")
-        
-        if data_input_mode == "Upload Excel Sheet":
-            synthetic_row_count = st.number_input("Define row count for GAN generated data", min_value=1, max_value=10000, value=st.session_state.generated_data.shape[0], step=100)
+        # Ask Gemini to return CSV and parse it
+        try:
+            sys_prompt = (
+                "You are a data generation expert. Generate realistic synthetic data as CSV only (with header), "
+                "no extra text or backticks. No missing values."
+            )
+            user_prompt = (
+                f"Generate {args.rows} rows of synthetic data based on this prompt:\n{prompt_text}\n"
+            )
+            resp = model.generate_content([sys_prompt, user_prompt])
+            csv_text = (resp.text or '').strip()
+            csv_text = re.sub(r"^```(?:csv)?", "", csv_text)
+            csv_text = re.sub(r"```$", "", csv_text)
+            df = pd.read_csv(StringIO(csv_text))
+        except Exception as ex:
+            eprint(f"Gemini CSV generation failed, using offline generator: {ex}")
+            df = generate_offline_dataset(prompt_text, args.rows)
+
+    dataset = dataset_from_df(df)
+    print(json.dumps(dataset))
+    return 0
+
+
+def cmd_process_file(args: argparse.Namespace) -> int:
+    path = args.file
+    if not os.path.exists(path):
+        eprint(f"File not found: {path}")
+        print(json.dumps({"error": f"File not found: {path}"}))
+        return 0
+    try:
+        if path.lower().endswith('.csv'):
+            df = pd.read_csv(path)
+        elif path.lower().endswith(('.xlsx', '.xls')):
+            # Requires openpyxl for .xlsx
+            df = pd.read_excel(path)
         else:
-            synthetic_row_count = st.session_state.generated_data.shape[0]
-        
-        if st.button("Reset Column Types"):
-            st.session_state.metadata = None
-            st.session_state.column_types = {}
-            st.session_state.id_column = None
-            st.experimental_rerun()
-        
-        if st.button("Train Custom Model"):
-            with st.spinner("Training Custom Model..."):
-                try:
-                    logger.info("Starting Model training process")
-                    constraints = json.loads(constraints_json)
-                    logger.info(f"Loaded constraints: {constraints}")
-                    logger.info("Current metadata configuration:")
-                    logger.info(json.dumps(st.session_state.metadata.to_dict(), indent=2))
-                    synthesizer = train_synthesizer(model_choice, st.session_state.generated_data, gan_params, st.session_state.metadata)
-                    logger.info("Generating synthetic data")
-                    st.session_state.gan_data = synthesizer.sample(synthetic_row_count)
-                    logger.info(f"Generated synthetic data shape: {st.session_state.gan_data.shape}")
-                    logger.info("Validating synthetic data")
-                    validation_results = validate_synthetic_data(st.session_state.generated_data, st.session_state.gan_data, constraints)
-                    logger.info(f"Validation results: {validation_results}")
-                    st.success("Model training completed!")
-    except Exception as e:
-                    logger.error("Error in Model training process:")
-        logger.error(traceback.format_exc())
-                    st.error(f"Model failed: {str(e)}")
+            print(json.dumps({"error": "Unsupported file type. Please upload CSV or Excel."}))
+            return 0
+        dataset = dataset_from_df(df)
+        print(json.dumps(dataset))
+    except Exception as ex:
+        eprint(f"process-file failed: {ex}")
+        print(json.dumps({"error": str(ex)}))
+    return 0
 
 
-# --- Results Section ---
-if st.session_state.gan_data is not None:
-    with st.expander("Step 3: Results Analysis", expanded=True):
-        st.subheader("Generated Dataset Preview")
-        st.dataframe(st.session_state.gan_data.head())
-        col1, col2 = st.columns(2)
-        with col1:
-            st.markdown("### Original Data Statistics")
-            st.write(st.session_state.generated_data.describe())
-        with col2:
-            st.markdown("### Custom-Generated Data Statistics")
-            st.write(st.session_state.gan_data.describe())
-        selected_column = st.selectbox("Select column for distribution comparison", options=st.session_state.gan_data.columns)
-        col1, col2 = st.columns(2)
-        with col1:
-            st.markdown("**Original Distribution**")
-            st.bar_chart(st.session_state.generated_data[selected_column].value_counts())
-        with col2:
-            st.markdown("**Synthetic Distribution**")
-            st.bar_chart(st.session_state.gan_data[selected_column].value_counts())
-        st.download_button(label="Download Synthetic Dataset", data=st.session_state.gan_data.to_csv(index=False).encode('utf-8'), file_name='synthetic_data.csv', mime='text/csv')
+def cmd_transform(args: argparse.Namespace) -> int:
+    # Security-first: do NOT execute arbitrary code. Return dataset unchanged.
+    try:
+        with open(args.dataset, 'r', encoding='utf-8') as f:
+            dataset = json.load(f)
+        # Return as-is to satisfy contract safely
+        print(json.dumps(dataset))
+    except Exception as ex:
+        eprint(f"transform failed: {ex}")
+        print(json.dumps({"error": str(ex)}))
+    return 0
 
-# --- Sidebar Information ---
-with st.sidebar:
-    st.header("📋 Information")
-    st.markdown("""
-    ### Features
-    - Large Concept Model powered data generation (if using prompt)
-    - Multi-model synthetic data generation (Deep Learning Models)
-    - Custom constraints and real-time distribution analysis
-    - Simplified, natural language data transformation for uploaded datasets
-    - Testing and rollback support for transformations
-    """)
+
+def cmd_generate_transformation(args: argparse.Namespace) -> int:
+    # Provide a no-op transformation; generation of arbitrary code is disabled by default.
+    no_op_code = "df = df"
+    print(no_op_code)
+    return 0
+
+
+def build_metadata_from_dataset(df: pd.DataFrame, dataset_meta: Dict[str, Any]) -> SingleTableMetadata:
+    metadata = SingleTableMetadata()
+    metadata.detect_from_dataframe(df)
+    column_types = dataset_meta.get('columnTypes', {})
+    for col, ctype in column_types.items():
+        try:
+            metadata.update_column(col, sdtype=ctype, table_name='default')
+        except Exception:
+            # Ignore unknown columns/types gracefully
+            pass
+    id_col = dataset_meta.get('idColumn')
+    if id_col and id_col in df.columns:
+        try:
+            if df[id_col].nunique() == len(df):
+                metadata.update_column(id_col, sdtype='id', table_name='default')
+        except Exception:
+            pass
+    return metadata
+
+
+def compute_validation(original_df: pd.DataFrame, synth_df: pd.DataFrame, constraints: Dict[str, Any]) -> Dict[str, Any]:
+    results: Dict[str, Any] = {}
+    for col in original_df.columns:
+        res: Dict[str, Any] = {
+            'originalMean': None,
+            'syntheticMean': None,
+            'originalStd': None,
+            'syntheticStd': None,
+            'constraintViolations': 0,
+        }
+        if pd.api.types.is_numeric_dtype(original_df[col]):
+            try:
+                res['originalMean'] = float(np.nanmean(original_df[col]))
+            except Exception:
+                res['originalMean'] = None
+            try:
+                res['syntheticMean'] = float(np.nanmean(synth_df[col]))
+            except Exception:
+                res['syntheticMean'] = None
+            try:
+                res['originalStd'] = float(np.nanstd(original_df[col]))
+            except Exception:
+                res['originalStd'] = None
+            try:
+                res['syntheticStd'] = float(np.nanstd(synth_df[col]))
+            except Exception:
+                res['syntheticStd'] = None
+        # Constraints
+        col_constraints = constraints.get(col) or constraints.get(to_snake(col)) or {}
+        try:
+            if 'min' in col_constraints:
+                res['constraintViolations'] += int((synth_df[col] < col_constraints['min']).sum())
+            if 'max' in col_constraints:
+                res['constraintViolations'] += int((synth_df[col] > col_constraints['max']).sum())
+        except Exception:
+            pass
+        results[col] = res
+    return results
+
+
+def cmd_train_model(args: argparse.Namespace) -> int:
+    try:
+        with open(args.dataset, 'r', encoding='utf-8') as f:
+            dataset_meta = json.load(f)
+        with open(args.config, 'r', encoding='utf-8') as f:
+            config = json.load(f)
+
+        # Build DataFrame from dataset
+        df = pd.DataFrame(dataset_meta['data'])
+        # Ensure column order
+        df = df[dataset_meta['columns']]
+
+        # Build metadata for SDV
+        metadata = build_metadata_from_dataset(df, dataset_meta)
+
+        model_type = config['modelType']
+        params = config.get('params', {})
+        epochs = int(params.get('epochs', 500))
+        batch_size = int(params.get('batchSize', 256))
+        generator_dim = params.get('generatorDim', [256, 256])
+        discriminator_dim = params.get('discriminatorDim', [256, 256])
+        learning_rate = float(params.get('learningRate', 0.0005))
+        pac = int(params.get('pac', 5))
+
+        if model_type == 'CTGAN':
+            synthesizer = CTGANSynthesizer(
+                metadata,
+                epochs=epochs,
+                batch_size=batch_size,
+                generator_dim=generator_dim,
+                discriminator_dim=discriminator_dim,
+                generator_lr=learning_rate,
+                discriminator_lr=learning_rate,
+                pac=pac,
+            )
+        elif model_type == 'TVAE':
+            synthesizer = TVAESynthesizer(
+                metadata,
+                epochs=epochs,
+                batch_size=batch_size,
+            )
+        elif model_type == 'CopulaGAN':
+            synthesizer = CopulaGANSynthesizer(
+                metadata,
+                epochs=epochs,
+                batch_size=batch_size,
+                generator_dim=generator_dim,
+                discriminator_dim=discriminator_dim,
+                generator_lr=learning_rate,
+                discriminator_lr=learning_rate,
+                pac=pac,
+            )
+        else:
+            print(json.dumps({"error": f"Unsupported modelType: {model_type}"}))
+            return 0
+
+        synthesizer.fit(df)
+        # Sample same number of rows by default
+        synth_rows = len(df)
+        synth_df = synthesizer.sample(synth_rows)
+
+        synthetic_dataset = dataset_from_df(synth_df, dataset_meta.get('idColumn'))
+        constraints = config.get('constraints', {})
+        validation = compute_validation(df, synth_df, constraints)
+
+        # Persist for download route
+        uploads_dir = ensure_uploads_dir()
+        csv_path = os.path.join(uploads_dir, 'synthetic_data.csv')
+        json_path = os.path.join(uploads_dir, 'synthetic_data.json')
+        try:
+            synth_df.to_csv(csv_path, index=False)
+            with open(json_path, 'w', encoding='utf-8') as f:
+                json.dump(synthetic_dataset, f)
+        except Exception as ex:
+            eprint(f"Failed to persist synthetic data: {ex}")
+
+        result = {
+            'syntheticData': synthetic_dataset,
+            'validationResults': validation,
+        }
+        print(json.dumps(result))
+    except Exception as ex:
+        eprint(f"train-model failed: {ex}")
+        print(json.dumps({"error": str(ex)}))
+    return 0
+
+
+def cmd_download(args: argparse.Namespace) -> int:
+    uploads_dir = ensure_uploads_dir()
+    fmt = args.format.lower()
+    if fmt == 'csv':
+        path = os.path.join(uploads_dir, 'synthetic_data.csv')
+    else:
+        path = os.path.join(uploads_dir, 'synthetic_data.json')
+    if not os.path.exists(path):
+        print(json.dumps({"filePath": ""}))
+        return 0
+    print(json.dumps({"filePath": path}))
+    return 0
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description='Synthetic Data Generator CLI')
+    sub = parser.add_subparsers(dest='command', required=True)
+
+    p_gen = sub.add_parser('generate', help='Generate dataset from prompt')
+    p_gen.add_argument('--prompt', required=True, help='Path to prompt text file')
+    p_gen.add_argument('--rows', required=True, type=int, help='Number of rows')
+    p_gen.add_argument('--use-engineering', required=False, default='false', help='true/false')
+    p_gen.set_defaults(func=cmd_generate)
+
+    p_eng = sub.add_parser('engineer-prompt', help='Engineer prompt text')
+    p_eng.add_argument('--prompt', required=True, help='Path to prompt text file')
+    p_eng.set_defaults(func=cmd_engineer_prompt)
+
+    p_con = sub.add_parser('generate-constraints', help='Generate constraints JSON from prompt')
+    p_con.add_argument('--prompt', required=True, help='Path to prompt text file')
+    p_con.set_defaults(func=cmd_generate_constraints)
+
+    p_proc = sub.add_parser('process-file', help='Process uploaded dataset file')
+    p_proc.add_argument('--file', required=True, help='Path to CSV/XLSX file')
+    p_proc.set_defaults(func=cmd_process_file)
+
+    p_tf = sub.add_parser('transform', help='Safely return dataset unchanged (transform disabled)')
+    p_tf.add_argument('--dataset', required=True, help='Path to dataset JSON')
+    p_tf.add_argument('--code', required=True, help='Path to transformation code (ignored)')
+    p_tf.set_defaults(func=cmd_transform)
+
+    p_gt = sub.add_parser('generate-transformation', help='Generate (no-op) transformation code')
+    p_gt.add_argument('--sample', required=True, help='Path to dataset sample JSON')
+    p_gt.add_argument('--instructions', required=True, help='Path to instructions text')
+    p_gt.set_defaults(func=cmd_generate_transformation)
+
+    p_tm = sub.add_parser('train-model', help='Train model and generate synthetic data')
+    p_tm.add_argument('--dataset', required=True, help='Path to dataset JSON')
+    p_tm.add_argument('--config', required=True, help='Path to model config JSON')
+    p_tm.set_defaults(func=cmd_train_model)
+
+    p_dl = sub.add_parser('download', help='Prepare latest synthetic data for download')
+    p_dl.add_argument('--format', required=True, choices=['csv', 'json'], help='Download format')
+    p_dl.set_defaults(func=cmd_download)
+
+    args = parser.parse_args()
+    # Normalize boolean flag
+    if hasattr(args, 'use_engineering'):
+        val = str(args.use_engineering).lower()
+        args.use_engineering = val in ('1', 'true', 'yes', 'y')
+    return args.func(args)
+
+
+if __name__ == '__main__':
+    sys.exit(main())
+

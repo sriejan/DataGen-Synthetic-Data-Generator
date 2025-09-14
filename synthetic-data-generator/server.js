@@ -8,6 +8,8 @@ const fs = require('fs');
 
 const app = express();
 const PORT = process.env.PORT || 8000;
+const PYTHON_BIN = process.env.PYTHON_BIN || (process.platform === 'win32' ? 'python' : 'python3');
+const SCRIPT_PATH = path.resolve(__dirname, '..', 'add2.py');
 
 // Middleware
 app.use(cors());
@@ -15,26 +17,38 @@ app.use(bodyParser.json({ limit: '50mb' }));
 app.use(bodyParser.urlencoded({ limit: '50mb', extended: true }));
 
 // Configure multer for file uploads
+const uploadsDir = path.join(__dirname, 'uploads');
 const storage = multer.diskStorage({
   destination: (req, file, cb) => {
-    cb(null, 'uploads/');
+    cb(null, uploadsDir);
   },
   filename: (req, file, cb) => {
     cb(null, Date.now() + path.extname(file.originalname));
   },
 });
-const upload = multer({ storage });
+const upload = multer({
+  storage,
+  limits: {
+    fileSize: 10 * 1024 * 1024, // 10MB
+  },
+  fileFilter: (req, file, cb) => {
+    const allowed = ['.csv', '.xls', '.xlsx'];
+    const ext = path.extname(file.originalname).toLowerCase();
+    if (allowed.includes(ext)) return cb(null, true);
+    cb(new Error('Only CSV, XLS, and XLSX files are allowed'));
+  },
+});
 
 // Create uploads directory if it doesn't exist
-if (!fs.existsSync('uploads')) {
-  fs.mkdirSync('uploads');
+if (!fs.existsSync(uploadsDir)) {
+  fs.mkdirSync(uploadsDir, { recursive: true });
 }
 
 // Helper function to run Python script
 const runPythonScript = (args) => {
   return new Promise((resolve, reject) => {
-    console.log(`Running Python script with args: ${args.join(' ')}`);
-    const pythonProcess = spawn('python', ['../add2.py', ...args]);
+    console.log(`Running Python script: ${PYTHON_BIN} ${SCRIPT_PATH} ${args.join(' ')}`);
+    const pythonProcess = spawn(PYTHON_BIN, [SCRIPT_PATH, ...args]);
     
     let result = '';
     let error = '';
@@ -80,7 +94,7 @@ app.post('/generate-data', async (req, res) => {
     const { prompt, rowCount, usePromptEngineering } = req.body;
     
     // Save prompt to a temporary file
-    const promptFilePath = path.join('uploads', `prompt_${Date.now()}.txt`);
+    const promptFilePath = path.join(uploadsDir, `prompt_${Date.now()}.txt`);
     fs.writeFileSync(promptFilePath, prompt);
     
     // Call Python script
@@ -146,7 +160,7 @@ app.post('/engineer-prompt', async (req, res) => {
     const { prompt } = req.body;
     
     // Save prompt to a temporary file
-    const promptFilePath = path.join('uploads', `prompt_${Date.now()}.txt`);
+    const promptFilePath = path.join(uploadsDir, `prompt_${Date.now()}.txt`);
     fs.writeFileSync(promptFilePath, prompt);
     
     // Call Python script
@@ -168,7 +182,7 @@ app.post('/generate-constraints', async (req, res) => {
     const { prompt } = req.body;
     
     // Save prompt to a temporary file
-    const promptFilePath = path.join('uploads', `prompt_${Date.now()}.txt`);
+    const promptFilePath = path.join(uploadsDir, `prompt_${Date.now()}.txt`);
     fs.writeFileSync(promptFilePath, prompt);
     
     // Call Python script
@@ -195,8 +209,8 @@ app.post('/train-model', async (req, res) => {
     console.log('Parameters:', JSON.stringify(modelConfig.params, null, 2));
     
     // Save dataset and config to temporary files
-    const datasetFilePath = path.join('uploads', `dataset_${Date.now()}.json`);
-    const configFilePath = path.join('uploads', `config_${Date.now()}.json`);
+    const datasetFilePath = path.join(uploadsDir, `dataset_${Date.now()}.json`);
+    const configFilePath = path.join(uploadsDir, `config_${Date.now()}.json`);
     
     fs.writeFileSync(datasetFilePath, JSON.stringify(dataset));
     fs.writeFileSync(configFilePath, JSON.stringify(modelConfig));
@@ -281,8 +295,8 @@ app.post('/apply-transformation', async (req, res) => {
     const { dataset, transformationCode } = req.body;
     
     // Save dataset and transformation code to temporary files
-    const datasetFilePath = path.join('uploads', `dataset_${Date.now()}.json`);
-    const codeFilePath = path.join('uploads', `code_${Date.now()}.py`);
+    const datasetFilePath = path.join(uploadsDir, `dataset_${Date.now()}.json`);
+    const codeFilePath = path.join(uploadsDir, `code_${Date.now()}.py`);
     
     fs.writeFileSync(datasetFilePath, JSON.stringify(dataset));
     fs.writeFileSync(codeFilePath, transformationCode);
@@ -311,8 +325,8 @@ app.post('/generate-transformation', async (req, res) => {
     const { datasetSample, transformationInstructions } = req.body;
     
     // Save sample and instructions to temporary files
-    const sampleFilePath = path.join('uploads', `sample_${Date.now()}.json`);
-    const instructionsFilePath = path.join('uploads', `instructions_${Date.now()}.txt`);
+    const sampleFilePath = path.join(uploadsDir, `sample_${Date.now()}.json`);
+    const instructionsFilePath = path.join(uploadsDir, `instructions_${Date.now()}.txt`);
     
     fs.writeFileSync(sampleFilePath, JSON.stringify(datasetSample));
     fs.writeFileSync(instructionsFilePath, transformationInstructions);
@@ -346,7 +360,9 @@ app.get('/download-data', async (req, res) => {
     
     // Return file for download
     const filePath = result.filePath;
-    
+    if (!filePath) {
+      return res.status(404).json({ error: 'No file available to download. Train a model first.' });
+    }
     res.download(filePath, `synthetic_data.${format}`, (err) => {
       if (err) {
         console.error('Error sending file:', err);

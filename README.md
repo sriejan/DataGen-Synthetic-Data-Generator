@@ -29,8 +29,8 @@ DataGen/
 ### Manual Setup
 1. **Backend**: Install Python dependencies from `requirements.txt`
 2. **Frontend**: Navigate to `synthetic-data-generator/` and run `npm install`
-3. Start the backend server: `node server.js`
-4. Start the frontend: `npm start`
+3. Start the backend server (from `synthetic-data-generator/`): `node server.js`
+4. Start the frontend (from `synthetic-data-generator/`): `npm start`
 
 ## Features
 
@@ -41,7 +41,7 @@ DataGen/
 
 ## Requirements
 
-- Node.js 16+
+- Node.js 18+ (or 20+)
 - Python 3.8+
 - Docker (optional)
 

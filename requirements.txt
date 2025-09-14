@@ -1,7 +1,7 @@
-streamlit
 pandas
 numpy
 openai
 sdv
 google-generativeai
 python-dotenv 
+openpyxl
